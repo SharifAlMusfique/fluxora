@@ -136,6 +136,42 @@ export interface Manifest {
   note?: string;
 }
 
+export interface MigrationCheck {
+  check: string;
+  pass: boolean;
+  detail: string;
+}
+
+export interface Migration {
+  result: string;
+  counts: { read: number; migrated: number; quarantined: number };
+  checks: MigrationCheck[];
+  quarantined: { row: number; record: string; claimId: string | null; reasons: string[] }[];
+  defaulted: { record: string; column: string; value: unknown }[];
+  source: { path: string; table: string; entitySet: string; sha256Before: string; sha256After?: string };
+  target: { store: string; document: string; id: string; partitionKey: string; file: string; sha256?: string };
+  replay: Replay | null;
+}
+
+export interface ReplayEntry {
+  id: string;
+  stored: string | null;
+  migratedApp: string | null;
+  errors: string[];
+  firedRules: string[];
+  detail?: string;
+}
+
+export interface Replay {
+  replayedAt: string;
+  asOf: string;
+  compared: number;
+  matched: number;
+  mismatched: ReplayEntry[];
+  noStoredStatus: ReplayEntry[];
+  result: string;
+}
+
 export interface Evidence {
   runId: string;
   fixture: string;
@@ -154,6 +190,7 @@ export interface Evidence {
   repairs: { attempts: number; fixed: string[]; unresolved: string[]; modes: Record<string, number> } | null;
   tamperGuard: { unchanged: boolean; sha256Before: string; sha256After: string; message?: string } | null;
   timings: Record<string, number> | null;
+  migration: Migration | null;
   dataNotes: string[];
 }
 

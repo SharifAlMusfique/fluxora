@@ -22,6 +22,7 @@ def load_run(run_dir: Path, root: Path = ROOT) -> dict:
         raise FileNotFoundError(f"No rules.json in {run_dir}")
     parity = _load(run_dir / "parity.json")
     repairs = _load(run_dir / "repairs.json")
+    migration = _load(run_dir / "migration.json")
     generated_dir = generated_dir_for(run_dir, root)
     manifest = _load(generated_dir / "manifest.json")
     if manifest and manifest.get("generatedFrom", {}).get("runId") != rules.get("runId"):
@@ -38,8 +39,9 @@ def load_run(run_dir: Path, root: Path = ROOT) -> dict:
         "parity": parity,
         "repairs": repairs,
         "manifest": manifest,
+        "migration": migration,
         "generatedDir": generated_label,
-        "evidence": summarize(rules, parity, repairs, manifest, cases),
+        "evidence": summarize(rules, parity, repairs, manifest, cases, migration),
     }
 
 
@@ -49,7 +51,9 @@ def generated_dir_for(run_dir: Path, root: Path = ROOT) -> Path:
     return own if (own / "manifest.json").is_file() else root / "generated"
 
 
-def summarize(rules: dict, parity: dict | None, repairs: dict | None, manifest: dict | None, cases: dict | None) -> dict:
+def summarize(
+    rules: dict, parity: dict | None, repairs: dict | None, manifest: dict | None, cases: dict | None, migration: dict | None = None
+) -> dict:
     statuses = [r["status"] for r in rules["rules"]]
     oracle: dict[str, int] = {}
     for case in (cases or {}).get("cases", []):
@@ -80,6 +84,17 @@ def summarize(rules: dict, parity: dict | None, repairs: dict | None, manifest: 
                 f"Repair attempt {attempt['attempt']} for {attempt['ruleId']} was a replay ({attempt.get('source')}), not a live LLM call."
             )
 
+    if migration:
+        notes.append(
+            f"The {migration['counts']['read']} Dataverse rows migrated to Cosmos DB documents are synthetic; "
+            f"{migration['counts']['quarantined']} carry planted data-quality problems and were quarantined, not dropped."
+        )
+        if migration.get("replay"):
+            notes.append(
+                "Replay statuses are compared with what the synthetic Dataverse rows store. Those stored statuses were produced "
+                "by the fixture's own script, not by a run of the original Power App."
+            )
+
     summary = {
         "runId": rules.get("runId"),
         "fixture": rules.get("fixture"),
@@ -97,8 +112,20 @@ def summarize(rules: dict, parity: dict | None, repairs: dict | None, manifest: 
         "repairs": None,
         "tamperGuard": None,
         "timings": None,
+        "migration": None,
         "dataNotes": notes,
     }
+    if migration:
+        summary["migration"] = {
+            "result": migration["result"],
+            "counts": migration["counts"],
+            "checks": migration["reconciliation"]["checks"],
+            "quarantined": migration["quarantined"],
+            "defaulted": migration["defaulted"],
+            "source": migration["source"],
+            "target": migration["target"],
+            "replay": migration.get("replay"),
+        }
     if parity:
         summary["parity"] = {
             "result": parity["summary"]["result"],
@@ -172,6 +199,20 @@ def render_markdown(run: dict, demo_timings: list[dict] | None = None) -> str:
         out.append(
             f"- **Repair:** {r['attempts']} attempt(s); fixed {', '.join(r['fixed']) or '-'}; unresolved {', '.join(r['unresolved']) or '-'}."
         )
+    m = ev.get("migration")
+    if m:
+        out.append(
+            f"- **Data migration:** **{m['result']}**: {m['counts']['read']} Dataverse rows read, {m['counts']['migrated']} migrated to "
+            f"Cosmos DB documents, {m['counts']['quarantined']} quarantined with a reason; "
+            f"{sum(c['pass'] for c in m['checks'])}/{len(m['checks'])} reconciliation checks pass."
+        )
+        rp = m.get("replay")
+        if rp:
+            out.append(
+                f"- **Replay:** **{rp['result']}**: {rp['matched']}/{rp['compared']} migrated claims get the same status from the "
+                f"migrated app as Dataverse stored (each evaluated as of its {rp['asOf']}); "
+                f"{len(rp['noStoredStatus'])} had no stored status to compare."
+            )
     guard = ev.get("tamperGuard")
     if guard:
         out.append(f"- **Tamper guard:** reference cases {'unchanged' if guard['unchanged'] else 'CHANGED'} (sha256 `{guard['sha256Before'][:16]}`).")
@@ -219,6 +260,41 @@ def render_markdown(run: dict, demo_timings: list[dict] | None = None) -> str:
                 out += ["```diff", a["diff"].rstrip("\n"), "```", ""]
             elif a.get("detail"):
                 out += [f"Detail: {_cell(a['detail'])}", ""]
+
+    if m:
+        out += [
+            "",
+            "## Data migration",
+            "",
+            f"`{m['source']['path']}` (Dataverse table `{m['source']['table']}`) to Cosmos DB documents shaped by "
+            f"`{m['target']['document']}` (id = `{m['target']['id']}`, partition key `{m['target']['partitionKey']}`), "
+            f"written to `runs/{run['runId']}/{m['target']['file']}`.",
+            "",
+            "| Reconciliation check | Result | Detail |",
+            "|---|---|---|",
+        ]
+        out += [f"| {_cell(c['check'])} | {'PASS' if c['pass'] else 'FAIL'} | {_cell(c['detail'])} |" for c in m["checks"]]
+        if m["quarantined"]:
+            out += ["", "**Quarantined rows** (not migrated; a person must fix or decide):", "", "| Claim ID | Dataverse row | Reasons |", "|---|---|---|"]
+            out += [f"| {_cell(q['claimId'])} | `{_cell(q['record'])}` | {_cell('; '.join(q['reasons']))} |" for q in m["quarantined"]]
+        if m["defaulted"]:
+            out += ["", "**Defaulted values** (empty in Dataverse, schema default applied):", ""]
+            out += [f"- `{d['column']}` = `{json.dumps(d['value'])}` on row `{d['record']}`" for d in m["defaulted"]]
+        rp = m.get("replay")
+        if rp:
+            out += [
+                "",
+                "### Replay: migrated claims through the migrated app",
+                "",
+                f"Each migrated claim was sent to `POST /claims/evaluate` with `asOf` = its `{rp['asOf']}` (the day the original app "
+                f"decided it), and the status that came back was compared with the status Dataverse stored. "
+                f"**{rp['result']}**: {rp['matched']}/{rp['compared']} match.",
+            ]
+            if rp["mismatched"]:
+                out += ["", "| Claim | Dataverse status | Migrated app | Errors |", "|---|---|---|---|"]
+                out += [f"| {x['id']} | {_cell(x['stored'])} | {_cell(x['migratedApp'])} | {_cell(', '.join(x['errors']) or '-')} |" for x in rp["mismatched"]]
+            for x in rp["noStoredStatus"]:
+                out.append(f"\n- Not compared: {x['id']} has no status in Dataverse (the migrated app says `{x['migratedApp']}`).")
 
     out += ["", "## Unsupported items", "", "| File | Ref | Construct | Reason |", "|---|---|---|---|"]
     for u in ev["unsupported"]:
